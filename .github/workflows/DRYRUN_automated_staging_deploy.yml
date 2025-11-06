@@ -1252,17 +1252,14 @@ jobs:
 
   #####################
   e2e_tests_smokes:
-    name: E2E tests smokes
-    permissions:
-      contents: write
-      packages: write
-      id-token: write
-    if: ${{ !failure() && !cancelled() && needs.setup.outputs.skip_deployment == 'false' }}
+    name: E2E tests smokes (SKIPPED - DRY RUN)
+    # DRY-RUN: Skipped because this calls external repo workflow with restricted permissions
+    if: false
     needs:
       - setup
       - after_staging
       - content_api_matrix_staging
-    uses: ./.github/workflows/e2e_tests.yml
+    uses: InformaPLC/smart-connections-monorepo/.github/workflows/e2e_tests.yml
     with:
       content-api-url: 'https://content.staging.scm.informagt.com/graphql'
       spec-tags: '@smokeTA and not @runLocally and not @content-model and not @iiris and not @ads'
@@ -1270,17 +1267,14 @@ jobs:
     secrets: inherit
 
   e2e_tests:
-    name: E2E tests full
-    permissions:
-      contents: write
-      packages: write
-      id-token: write
-    if: ${{ !failure() && !cancelled() && needs.setup.outputs.skip_deployment == 'false' }}
+    name: E2E tests full (SKIPPED - DRY RUN)
+    # DRY-RUN: Skipped because this calls external repo workflow with restricted permissions
+    if: false
     needs:
       - setup
       - after_staging
       - content_api_matrix_staging
-    uses: ./.github/workflows/e2e_tests.yml
+    uses: InformaPLC/smart-connections-monorepo/.github/workflows/e2e_tests.yml
     with:
       content-api-url: 'https://content.staging.scm.informagt.com/graphql'
       spec-tags: 'not @runLocally and not @content-model and not @iiris and not @ads'
@@ -1288,17 +1282,14 @@ jobs:
     secrets: inherit
 
   e2e_iiris_tests:
-    name: E2E iiris tests
-    permissions:
-      contents: write
-      packages: write
-      id-token: write
-    if: ${{ !failure() && !cancelled() && needs.setup.outputs.skip_deployment == 'false' }}
+    name: E2E iiris tests (SKIPPED - DRY RUN)
+    # DRY-RUN: Skipped because this calls external repo workflow with restricted permissions
+    if: false
     needs:
       - setup
       - after_staging
       - content_api_matrix_staging
-    uses: ./.github/workflows/e2e_tests.yml
+    uses: InformaPLC/smart-connections-monorepo/.github/workflows/e2e_tests.yml
     with:
       content-api-url: 'https://content.staging.scm.informagt.com/graphql'
       spec-tags: '@iiris and not @runLocally'
