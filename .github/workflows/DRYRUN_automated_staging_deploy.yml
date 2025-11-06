@@ -1,0 +1,1557 @@
+name: '[DRY-RUN] Automated staging deploy - NO REAL DEPLOYMENTS'
+on:
+  push:
+    branches:
+      - test/pr-12707-validation
+  workflow_dispatch:
+  # merge_group: # DISABLED
+
+env:
+  base_sha: ${{ github.event.merge_group.base_sha }}
+  head_sha: ${{ github.event.merge_group.head_sha }}
+  package_weights: '@scm/frontend:40,@informa/content-api:40,@informa/redirects-api-lambda:40,@informa/inbound-content-lambda:20,@informa/extensions-lambda:10,@informa/sitemap-lambda:10'
+  max-per-unit-agent: '40'
+  max-per-typescript-agent: '80'
+
+jobs:
+  setup:
+    name: Setup CI/CD
+    outputs:
+      all_matrix_preview: ${{ steps.set-matrix-preview.outputs.all_matrix }}
+      all_matrix_staging: ${{ steps.set-matrix-staging.outputs.all_matrix }}
+      nx_affected: ${{ steps.nx-affected.outputs.nx-affected }}
+      shouldRunContentE2E: ${{ steps.nx-affected.outputs.shouldRunContentE2E }}
+      frontend_matrix_preview: ${{ steps.set-matrix-preview.outputs.frontend_matrix }}
+      frontend_matrix_staging: ${{ steps.set-matrix-staging.outputs.frontend_matrix }}
+      frontend_component_library: ${{ steps.set-matrix-preview.outputs.frontend_component_library }}
+      lambda2_matrix_preview: ${{ steps.set-matrix-preview.outputs.lambda2_matrix }}
+      lambda2_matrix_staging: ${{ steps.set-matrix-staging.outputs.lambda2_matrix }}
+      content_api_matrix_preview: ${{ steps.set-matrix-preview.outputs.content_api_matrix }}
+      content_api_matrix_staging: ${{ steps.set-matrix-staging.outputs.content_api_matrix }}
+      ui_matrix_staging: ${{ steps.set-matrix-staging.outputs.ui_matrix }}
+      worker_matrix_staging: ${{ steps.set-matrix-staging.outputs.worker_matrix }}
+      unit_test_agents: ${{ steps.calculate-unit-test-agents.outputs.test_agents }}
+      typescript_test_agents: ${{ steps.calculate-typescript-test-agents.outputs.test_agents }}
+      branch_name: ${{ steps.branch-name.outputs.current_branch }}
+      skip_deployment: ${{ steps.check_all_matrix.outputs.skip_deployment }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+      actions: write
+      checks: write
+      issues: write
+      pull-requests: write
+      statuses: write
+      deployments: write
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        uses: ./.github/actions/install_deps
+        timeout-minutes: 10
+        with:
+          npm-token: ${{ secrets.GITHUB_TOKEN }}
+          setup: 'false'
+
+      - name: Get NX Affected Packages
+        id: nx-affected
+        uses: ./.github/actions/nx_affected_packages
+        with:
+          base-sha: '${{ env.base_sha }}'
+          head-sha: '${{ env.head_sha }}'
+
+      - name: Get all packages
+        id: all-packages
+        uses: InformaPLC/scm-get-all-packages-action@v1.0.2
+
+      - name: Get Packages Metadata Preview
+        uses: InformaPLC/scm-changed-packages-metadata-action@v1.0.12
+        with:
+          allPackages: ${{ steps.all-packages.outputs.allPackages }}
+          affected: ${{ steps.nx-affected.outputs.nx-affected }}
+          outputFilename: tools/cli/src/matrix/changed.generated.preview.json
+          environment: preview
+
+      - name: Get Packages Metadata staging
+        uses: InformaPLC/scm-changed-packages-metadata-action@v1.0.12
+        with:
+          allPackages: ${{ steps.all-packages.outputs.allPackages }}
+          affected: ${{ steps.nx-affected.outputs.nx-affected }}
+          outputFilename: tools/cli/src/matrix/changed.generated.staging.json
+          environment: staging
+
+      - name: Output changed generated preview json
+        id: changedGeneratedPreview
+        run: |
+          cat tools/cli/src/matrix/changed.generated.preview.json
+          echo "changedGeneratedPreview=$(cat tools/cli/src/matrix/changed.generated.preview.json)" >> $GITHUB_OUTPUT
+
+      - name: Output changed generated staging json
+        id: changedGeneratedStaging
+        run: |
+          cat tools/cli/src/matrix/changed.generated.staging.json
+          echo "changedGeneratedStaging=$(cat tools/cli/src/matrix/changed.generated.staging.json)" >> $GITHUB_OUTPUT
+
+      - name: Get branch name
+        id: branch-name
+        uses: tj-actions/branch-names@v9
+
+      - name: Set matrix Preview
+        id: set-matrix-preview
+        uses: InformaPLC/scm-matrix-action@v1.0.13
+        with:
+          matrixEnv: preview
+          changedGenerated: ${{ steps.changedGeneratedPreview.outputs.changedGeneratedPreview }}
+        env:
+          ENVIRONMENT: preview
+          CURRENT_BRANCH: ${{ steps.branch-name.outputs.current_branch }}
+          GITHUB_PR_NUM: ${{ github.event.number }}
+
+      - name: Set matrix Staging
+        id: set-matrix-staging
+        uses: InformaPLC/scm-matrix-action@v1.0.13
+        with:
+          matrixEnv: staging2
+          changedGenerated: ${{ steps.changedGeneratedStaging.outputs.changedGeneratedStaging }}
+        env:
+          ENVIRONMENT: staging
+          CURRENT_BRANCH: ${{ steps.branch-name.outputs.current_branch }}
+          GITHUB_PR_NUM: ${{ github.event.number }}
+
+      - name: Install node_modules for actions
+        id: install_actions_node_modules
+        uses: bahmutov/npm-install@v1
+        with:
+          working-directory: ./.github/actions/setup-agent
+          useLockFile: false
+
+      - name: Setup unit test agents
+        id: calculate-unit-test-agents
+        uses: ./.github/actions/setup-agent
+        with:
+          packages: '${{ steps.set-matrix-preview.outputs.all_matrix }}'
+          weights: '${{ env.package_weights }}'
+          max-per-agent: '${{ env.max-per-unit-agent }}'
+
+      - name: Setup typescript test agents
+        id: calculate-typescript-test-agents
+        uses: ./.github/actions/setup-agent
+        with:
+          packages: '${{ steps.set-matrix-preview.outputs.all_matrix }}'
+          max-per-agent: '${{ env.max-per-typescript-agent }}'
+
+      - name: Check matrix for empty
+        id: check_all_matrix
+        run: |
+          if [[ "${{ steps.set-matrix-preview.outputs.all_matrix }}" == "" ]]; then
+            echo "skip_deployment=true"
+            echo "skip_deployment=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip_deployment=false"
+            echo "skip_deployment=false" >> $GITHUB_OUTPUT
+          fi
+
+  unit_tests:
+    name: Tests |> test:unit:ci
+    runs-on: ubuntu22-8core
+    if: needs.setup.outputs.skip_deployment == 'false'
+    needs: setup
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+      issues: read
+      checks: write
+      pull-requests: write
+      pages: write
+      actions: write
+    env:
+      bucket-test-reports: 's3://preview-scm-test-reports-bucket'
+    outputs:
+      lcov-artifact-upload: ${{ steps.check-lcov.outputs.lcov-artifact-upload }}
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: ${{ fromJSON(needs.setup.outputs.unit_test_agents) }}
+        action: ['test:unit:ci']
+    timeout-minutes: 40
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v4
+
+      - name: Install node_modules for actions
+        id: install_actions_node_modules
+        uses: bahmutov/npm-install@v1
+        with:
+          working-directory: ./.github/actions/split-packages-list
+          useLockFile: false
+
+      - name: Get test packages
+        uses: ./.github/actions/split-packages-list
+        with:
+          packages: '${{ needs.setup.outputs.all_matrix_preview }}'
+          agent: '${{ matrix.agent }}'
+          weights: '${{ env.package_weights }}'
+          max-per-agent: '${{ env.max-per-unit-agent }}'
+
+      - name: Install Dependencies
+        if: env.package_string != 'SKIP'
+        uses: ./.github/actions/install_deps
+        with:
+          npm-token: ${{ secrets.GITHUB_TOKEN }}
+          setup: 'true'
+
+      # - name: configure aws credentials
+      #   if: env.package_string != 'SKIP'
+      #   # DRYRUN: uses: aws-actions/configure-aws-credentials@v4
+      #   # with:
+      #     # DRYRUN: role-to-assume: arn:aws:iam::050114398921:role/preview-cicd-role
+      #     # DRYRUN: role-session-name: SCM-CICD
+      #     # DRYRUN: aws-region: us-east-1
+
+      - name: Tests test:unit:ci
+        if: env.package_string != 'SKIP'
+        shell: bash
+        run: |
+          yarn ${{ matrix.action }} --projects=${{ env.package_string }} --verbose
+
+      - name: group lcov.info
+        if: env.package_string != 'SKIP'
+        run: |
+          mkdir -p lcov_reports
+          find {packages,services} -name "lcov.info" -exec sh -c 'mkdir -p lcov_reports/unit_test_${{ matrix.agent }}/$(dirname {}) && cp {} lcov_reports/unit_test_${{ matrix.agent }}/$(dirname {})' \;
+
+      - name: Upload coverage files
+        if: env.package_string != 'SKIP'
+        id: lcov-artifact-upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-unit-${{ matrix.agent }}
+          path: lcov_reports/
+        continue-on-error: true
+
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: env.package_string != 'SKIP'
+        with:
+          check_name: 'Unit Test Results'
+          files: |
+            **/reports/report.xml
+        continue-on-error: true
+
+      - name: Cancel if failure
+        if: failure()
+        uses: andymckay/cancel-action@0.4
+
+  typescript_tests:
+    name: Tests |> test:typescript:ci
+    runs-on: ubuntu22-4core
+    if: needs.setup.outputs.skip_deployment == 'false'
+    needs: setup
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+      issues: read
+      checks: write
+      pull-requests: write
+      pages: write
+      actions: write
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: ${{ fromJSON(needs.setup.outputs.typescript_test_agents) }}
+        action: ['test:typescript:ci']
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install node_modules for actions
+        id: install_actions_node_modules
+        uses: bahmutov/npm-install@v1
+        with:
+          working-directory: ./.github/actions/split-packages-list
+          useLockFile: false
+
+      - name: Get test packages
+        uses: ./.github/actions/split-packages-list
+        with:
+          packages: '${{ needs.setup.outputs.all_matrix_preview }}'
+          agent: '${{ matrix.agent }}'
+          max-per-agent: '${{ env.max-per-typescript-agent }}'
+
+      - name: Install Dependencies
+        if: env.package_string != 'SKIP'
+        uses: ./.github/actions/install_deps
+        with:
+          npm-token: ${{ secrets.GITHUB_TOKEN }}
+          setup: 'true'
+
+      # - name: configure aws credentials
+      #   if: env.package_string != 'SKIP'
+      #   # DRYRUN: uses: aws-actions/configure-aws-credentials@v4
+      #   # with:
+      #     # DRYRUN: role-to-assume: arn:aws:iam::050114398921:role/preview-cicd-role
+      #     # DRYRUN: role-session-name: SCM-CICD
+      #     # DRYRUN: aws-region: us-east-1
+
+      - name: Tests test:typescript:ci
+        if: env.package_string != 'SKIP'
+        shell: bash
+        run: |
+          yarn ${{ matrix.action }} --projects=${{ env.package_string }} --runner=remotecache-s3 --verbose --base=${{ env.base_sha }} --head=${{ env.head_sha }}
+
+      - name: Cancel if failure
+        if: failure()
+        uses: andymckay/cancel-action@0.4
+
+  integration_tests:
+    name: Tests |> test:integration:ci
+    runs-on: ubuntu22-4core
+    if: needs.setup.outputs.skip_deployment == 'false'
+    needs: setup
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+      issues: read
+      checks: write
+      pull-requests: write
+      pages: write
+      actions: write
+    env:
+      bucket-test-reports: 's3://preview-scm-test-reports-bucket'
+    outputs:
+      lcov-artifact-upload: ${{ steps.check-lcov.outputs.lcov-artifact-upload }}
+    timeout-minutes: 40
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        uses: ./.github/actions/install_deps
+        with:
+          npm-token: ${{ secrets.GITHUB_TOKEN }}
+          setup: 'true'
+
+      # - name: configure aws credentials
+      #   # DRYRUN: uses: aws-actions/configure-aws-credentials@v4
+      #   # with:
+      #     # DRYRUN: role-to-assume: arn:aws:iam::050114398921:role/preview-cicd-role
+      #     # DRYRUN: role-session-name: SCM-CICD
+      #     # DRYRUN: aws-region: us-east-1
+
+      - name: Tests test:integration:ci
+        shell: bash
+        run: |
+          yarn test:integration:ci --verbose --base=${{ env.base_sha }} --head=${{ env.head_sha }}
+
+      - name: group lcov.info
+        run: |
+          mkdir -p lcov_reports
+          find {packages,services} -name "lcov.info" -exec sh -c 'mkdir -p lcov_reports/integration_test/$(dirname {}) && cp {} lcov_reports/integration_test/$(dirname {})' \;
+
+      - name: Upload coverage files
+        id: lcov-artifact-upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-integration
+          path: lcov_reports/
+        continue-on-error: true
+
+      - name: Cancel if failure
+        if: failure()
+        uses: andymckay/cancel-action@0.4
+
+  lint_format_tests:
+    if: needs.setup.outputs.skip_deployment == 'false'
+    name: Tests |> test:lint, test:format
+    runs-on: ubuntu22-4core
+    needs: setup
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+      issues: read
+      checks: write
+      pull-requests: write
+      pages: write
+      actions: write
+    timeout-minutes: 40
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        uses: ./.github/actions/install_deps
+        with:
+          npm-token: ${{ secrets.GITHUB_TOKEN }}
+          setup: 'false'
+
+      # - name: configure aws credentials
+      #   # DRYRUN: uses: aws-actions/configure-aws-credentials@v4
+      #   # with:
+      #     # DRYRUN: role-to-assume: arn:aws:iam::050114398921:role/preview-cicd-role
+      #     # DRYRUN: role-session-name: SCM-CICD
+      #     # DRYRUN: aws-region: us-east-1
+
+      - name: Tests test:lint test:format
+        shell: bash
+        run: |
+          yarn test:lint --runner=remotecache-s3 --verbose --base=${{ env.base_sha }} --head=${{ env.head_sha }}
+          yarn test:format --runner=remotecache-s3 --verbose --base=${{ env.base_sha }} --head=${{ env.head_sha }}
+
+  frontend_component_library:
+    name: Frontend Component Library |> ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.frontend_component_library) }}
+    needs: setup
+    runs-on: ubuntu22-4core
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+      issues: read
+      checks: write
+      pull-requests: write
+      actions: write
+    outputs:
+      skipped: ${{ steps.check_skip.outputs.skipped }}
+    steps:
+      - name: Checkout the repository
+        if: matrix.isFull || matrix.isPartial
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.head_sha }}
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        if: matrix.isFull || matrix.isPartial
+        uses: ./.github/actions/install_deps
+        timeout-minutes: 10
+        with:
+          npm-token: ${{ secrets.GITHUB_TOKEN }}
+          setup: 'true'
+
+      - name: Build; Deploy; Storybook and Component tests
+        if: matrix.run
+        uses: ./.github/actions/frontend_component_library/1-build-deploy-storybook
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHROMATIC_TOKEN_SCM: ${{ secrets.CHROMATIC_TOKEN_SCM }}
+
+      - name: Upload storybook-static
+        if: matrix.run
+        uses: actions/upload-artifact@v4
+        with:
+          name: storybook-static
+          path: ./services/frontend/storybook-static
+
+      - name: Check Skip
+        id: check_skip
+        run: |
+          if [[ "${{ matrix.run }}" == "true" ]]; then
+            echo "skipped=false" >> $GITHUB_OUTPUT
+          else
+            echo "skipped=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Cancel if failure
+        if: failure()
+        uses: andymckay/cancel-action@0.4
+
+  matrix_test_parallelization:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix_test_parallelization.outputs.matrix }}
+    needs: setup
+    steps:
+      - name: Create matrix for tests
+        id: matrix_test_parallelization
+        uses: bahmutov/gh-build-matrix@main
+        with:
+          n: 5 # number of containers to output
+
+      - name: Print result 🖨
+        run: echo '${{ steps.matrix_test_parallelization.outputs.matrix }}'
+
+      - name: Cancel if failure
+        if: failure()
+        uses: andymckay/cancel-action@0.4
+
+  frontend_component_library_tests:
+    needs:
+      - setup
+      - frontend_component_library
+      - matrix_test_parallelization
+    if: ${{ needs.frontend_component_library.outputs.skipped == 'false' }}
+    runs-on: ubuntu22-8core
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix_test_parallelization.outputs.matrix) }}
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+      issues: read
+      checks: write
+      pull-requests: write
+      actions: write
+    env:
+      SCREENSHOT_FOLDER: '/home/runner/work/smart-connections-monorepo/smart-connections-monorepo/services/frontend/cypress/screenshots/'
+      JUNIT_FILES: '/home/runner/work/smart-connections-monorepo/smart-connections-monorepo/services/frontend/cypress/results/component/junit.xml'
+      check_skip: ${{needs.frontend_component_library.outputs.check_skip}}
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.head_sha }}
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        uses: ./.github/actions/install_deps
+        timeout-minutes: 10
+        with:
+          npm-token: ${{ secrets.GITHUB_TOKEN }}
+          setup: 'true'
+
+      - name: Download storybook-static
+        uses: actions/download-artifact@v4
+        with:
+          name: storybook-static
+          path: ./services/frontend/storybook-static
+
+      - name: Serve Storybook
+        shell: bash
+        run: |
+          yarn nx run @scm/frontend:storybook:serve:ci
+
+      - name: Run split Cypress tests 🧪
+        uses: cypress-io/github-action@v6
+        with:
+          install: false
+          project: ./services/frontend
+          config-file: cypress.config.storybook.ts
+          browser: electron
+        env:
+          SPLIT: ${{ strategy.job-total }}
+          SPLIT_INDEX: ${{ strategy.job-index }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NX_AFFECTED: ${{ needs.setup.outputs.nx_affected }}
+          NODE_OPTIONS: '--no-experimental-require-module --no-experimental-detect-module'
+
+      - name: Upload cypress-screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cypress-screenshots
+          path: ${{ env.SCREENSHOT_FOLDER }}
+
+  frontend_matrix_preview:
+    name: Frontend |> ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.frontend_matrix_preview) }}
+    needs: setup
+    runs-on: ubuntu22-8core
+    permissions:
+      actions: write
+      id-token: write
+      contents: write
+      packages: write
+      security-events: write
+    steps:
+      - name: Checkout the repository
+        if: matrix.run
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        if: matrix.run
+        uses: ./.github/actions/install_deps
+        timeout-minutes: 10
+        with:
+          npm-token: ${{ secrets.GITHUB_TOKEN }}
+          setup: 'false'
+
+      - name: AWS credentials; Login to ECR; Docker Context for Buildx; Set up Docker Buildx; Install volta cli;
+        if: matrix.run
+        id: login-ecr
+        uses: ./.github/actions/container_matrix/1-aws-docker-volta_cli
+
+      - name: Build, tag and push image to Amazon ECR; Get Infra Vars
+        if: matrix.run
+        uses: ./.github/actions/container_matrix/2-build-vars
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          login-ecr: ${{ steps.login-ecr.outputs.registry }}
+
+      - name: Get type of branch
+        if: matrix.run
+        run: |
+          import os
+          with open(os.getenv('GITHUB_ENV'), "a") as myfile:
+            myfile.write(f"branch_type={'${{ github.head_ref }}'.split('/')[0]}\n")
+          print(f"${{ github.head_ref }}".split('/')[0])
+        shell: python
+
+      - name: Render ECS task definition; Create Target Group and Listener Rule; Create/update ECS service; Update CloudFlare; Run container image; Wait for Service
+        if: matrix.run
+        uses: ./.github/actions/container_matrix/3-ecs-dns
+        with:
+          login-ecr: ${{ steps.login-ecr.outputs.registry }}
+
+      - name: Apply New Relic Deployment Marker
+        if: matrix.run
+        continue-on-error: true
+        uses: InformaPLC/newrelic-deployment-marker-action@v1.0.3
+        with:
+          name: preview-frontend-pr-${{ matrix.prNum }}
+          type: apm
+          region: EU
+          version: ${{ matrix.prNum }}
+
+      - name: Wait for ECS Service
+        if: matrix.run
+        uses: ./.github/actions/container_matrix/tests-ecs
+
+  content_api_matrix_preview:
+    name: Content API |> ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.content_api_matrix_preview) }}
+    needs: setup
+    runs-on: ubuntu22-4core
+    permissions:
+      actions: write
+      id-token: write
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout the repository
+        if: matrix.run
+        uses: actions/checkout@v4
+
+      - name: AWS credentials; Login to ECR; Docker Context for Buildx; Set up Docker Buildx; Install volta cli;
+        if: matrix.run
+        id: login-ecr
+        uses: ./.github/actions/container_matrix/1-aws-docker-volta_cli
+
+      - name: Build, tag and push image to Amazon ECR; Get Infra Vars
+        if: matrix.run
+        uses: ./.github/actions/container_matrix/2-build-vars
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          login-ecr: ${{ steps.login-ecr.outputs.registry }}
+
+      - name: Get type of branch
+        if: matrix.run
+        run: |
+          import os
+          with open(os.getenv('GITHUB_ENV'), "a") as myfile:
+            myfile.write(f"branch_type={'${{ github.head_ref }}'.split('/')[0]}\n")
+          print(f"${{ github.head_ref }}".split('/')[0])
+        shell: python
+
+      - name: Render ECS task definition; Create Target Group and Listener Rule; Create/update ECS service; Update CloudFlare; Run container image; Wait for Service
+        if: matrix.run
+        uses: ./.github/actions/container_matrix/3-ecs-dns
+        with:
+          login-ecr: ${{ steps.login-ecr.outputs.registry }}
+
+  lambda2_matrix_preview:
+    name: Lambda2 |> ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.lambda2_matrix_preview) }}
+    needs: setup
+    runs-on: ubuntu22-4core
+    permissions:
+      actions: write
+      id-token: write
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout the repository
+        if: matrix.run && matrix.vertical == 'unified'
+        uses: actions/checkout@v4
+
+      - name: Get type of branch
+        if: matrix.run
+        run: |
+          import os
+          with open(os.getenv('GITHUB_ENV'), "a") as myfile:
+            myfile.write(f"branch_type={'${{ github.head_ref }}'.split('/')[0]}\n")
+          print(f"${{ github.head_ref }}".split('/')[0])
+        shell: python
+
+      - name: aws credentials; Login to ECR; Get and extract latest New Relic Lambda Layer; Build, tag and push Lambda Docker image to Amazon ECR
+        if: matrix.run
+        id: login-ecr
+        uses: ./.github/actions/lambda2/1-test-aws-build
+        with:
+          npm-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lambda - Version Cleanup / Storage Check; Set Alias; Lambda Deploy
+        if: matrix.run
+        uses: ./.github/actions/lambda2/3-alias-deploy
+
+      - name: Apply New Relic Deployment Marker
+        if: matrix.run
+        continue-on-error: true
+        uses: InformaPLC/newrelic-deployment-marker-action@v1.0.3
+        with:
+          name: ${{ matrix.environment }}-${{ matrix.shortName }}
+          type: lambda
+          region: EU
+          version: ${{ matrix.prNum }}
+
+      - name: Dynamic Backend - API Gateway Deployment / API Base Path Mapping / Associate WebACL to API Gateway Stage / Lambda Permissions to API Gateway; Sleep; Content Lambda Smoke Test
+        if: matrix.run
+        uses: ./.github/actions/lambda2/4-dynamic_backend
+
+      - name: Cancel if failure
+        if: failure()
+        uses: andymckay/cancel-action@0.4
+
+  content_api_e2e:
+    name: Content API e2e |>
+    if: ${{ needs.setup.outputs.shouldRunContentE2E == 'true' }}
+    needs: setup
+    runs-on: ubuntu22-4core
+    permissions:
+      actions: write
+      id-token: write
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        uses: ./.github/actions/install_deps
+        timeout-minutes: 10
+        with:
+          npm-token: ${{ secrets.GITHUB_TOKEN }}
+          setup: 'true'
+
+      - name: E2E tests
+        shell: bash
+        run: yarn nx run @informa/content-api:test:e2e:ci
+
+      - name: Cancel if failure
+        if: failure()
+        uses: andymckay/cancel-action@0.4
+
+  after_preview:
+    name: After Preview
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    needs:
+      - setup
+      - typescript_tests
+      - integration_tests
+      - lint_format_tests
+      - unit_tests
+      - frontend_matrix_preview
+      - frontend_component_library
+      - lambda2_matrix_preview
+      - content_api_matrix_preview
+      - content_api_e2e
+      - frontend_component_library_tests
+    steps:
+      - name: Check pipeline status
+        run: |
+          echo "setup = ${{ needs.setup.result }}"
+          echo "typescript_tests = ${{ needs.typescript_tests.result }}"
+          echo "integration_tests = ${{ needs.integration_tests.result }}"
+          echo "lint_format_tests = ${{ needs.lint_format_tests.result }}"
+          echo "unit_tests = ${{ needs.unit_tests.result }}"
+          echo "frontend_matrix_preview = ${{ needs.frontend_matrix_preview.result }}"
+          echo "lambda2_matrix_preview = ${{ needs.lambda2_matrix_preview.result }}"
+          echo "content_api_matrix_preview = ${{ needs.content_api_matrix_preview.result }}"
+          echo "frontend_component_library = ${{ needs.frontend_component_library.result }}"
+          echo "content_api_e2e = ${{ needs.content_api_e2e.result }}"
+          echo "frontend_component_library_tests = ${{ needs.frontend_component_library.result }}"
+          if [ "${{ needs.setup.result }}" != "success" ] || \
+              [ "${{ needs.frontend_matrix_preview.result }}" != "success" ] || \
+              [ "${{ needs.lambda2_matrix_preview.result }}" != "success" ] || \
+              [ "${{ needs.content_api_matrix_preview.result }}" != "success" ]
+          then
+            echo "Pipeline failed, check the logs on other steps please."
+            exit 1
+          fi
+
+          if [ \
+            \( "${{ needs.typescript_tests.result }}" == "success" -o "${{ needs.typescript_tests.result }}" == "skipped" \) -a \
+            \( "${{ needs.integration_tests.result }}" == "success" -o "${{ needs.integration_tests.result }}" == "skipped" \) -a \
+            \( "${{ needs.lint_format_tests.result }}" == "success" -o "${{ needs.lint_format_tests.result }}" == "skipped" \) -a \
+            \( "${{ needs.unit_tests.result }}" == "success" -o "${{ needs.unit_tests.result }}" == "skipped" \) -a \
+            \( "${{ needs.frontend_component_library.result }}" == "success" -o "${{ needs.frontend_component_library.result }}" == "skipped" \) -a \
+            \( "${{ needs.content_api_e2e.result }}" == "success" -o "${{ needs.content_api_e2e.result }}" == "skipped" \) \
+          ]; then
+            echo "Pipeline passed! hooray!!"
+          else
+            echo "Pipeline failed, check the logs on other steps please."
+            exit 1
+          fi
+  # #####################
+  lambda2_matrix_staging:
+    name: Lambda2 staging |> ${{ matrix.name }}
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.lambda2_matrix_staging) }}
+    needs:
+      - setup
+      - after_preview
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      pull-requests: write
+      issues: write
+      packages: write
+      security-events: write
+    steps:
+      - name: Checkout the repository
+        if: matrix.run
+        uses: actions/checkout@v4
+
+      # - name: configure aws credentials
+      #   if: matrix.run && matrix.vertical == 'unified'
+      #   # DRYRUN: uses: aws-actions/configure-aws-credentials@v4
+      #   # with:
+      #     # DRYRUN: role-to-assume: arn:aws:iam::${{ matrix.accountId }}:role/${{ matrix.environment }}-cicd-role
+      #     # DRYRUN: role-session-name: SCM-CICD
+      #     # DRYRUN: aws-region: ${{ matrix.awsRegion }}
+
+      - name: Login to Amazon ECR
+        if: matrix.run
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: 'true'
+
+      - name: Lambda Version Cleanup
+        if: matrix.run && matrix.vertical == 'unified'
+        uses: InformaPLC/lambda-version-cleanup-action@v1.0.1
+        with:
+          lambda_function: ${{ matrix.environment }}-${{ matrix.shortName }}
+          max_unaliased_versions: 100
+
+      - name: Lambda Storage Check
+        if: matrix.run && matrix.vertical == 'unified'
+        uses: InformaPLC/lambda-storage-check-action@v1.0.1
+        with:
+          total_size_limit_gib: 75
+          storage_threshold_percent: 90
+
+      # - name: Lambda Deploy To Staging Environment
+      #   if: matrix.run && matrix.vertical == 'unified'
+      # # DRYRUN:         uses: InformaPLC/lambda-deploy-action@v1.0.3
+      #   with:
+      #   # DRYRUN:           function_name: ${{ matrix.environment }}-${{ matrix.shortName }}
+      #   # DRYRUN:           lambda_type: 'container'
+      #   # DRYRUN:           container_image: ${{ steps.login-ecr.outputs.registry }}/${{ matrix.shortName }}:${{ matrix.prNum }}
+      #     architecture: 'x86_64'
+      #     codedeploy_enabled: 'yes'
+      #     version_description: pr-${{ matrix.prNum }}:main
+      #     codedeploy_app_name: ${{ matrix.environment }}-${{ matrix.shortName }}
+      #     codedeploy_dg_name: ${{ matrix.environment }}-${{ matrix.shortName }}
+      #   # DRYRUN:           lambda_alias: 'PRE-LIVE'
+
+      - name: Apply New Relic Deployment Marker
+        if: matrix.run
+        continue-on-error: true
+        uses: InformaPLC/newrelic-deployment-marker-action@v1.0.3
+        with:
+          name: ${{ matrix.environment }}-${{ matrix.shortName }}
+          type: lambda
+          region: EU
+          version: ${{ matrix.prNum }}
+
+  content_api_matrix_staging:
+    if: ${{ !failure() && !cancelled() }}
+    name: Content API staging |> ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.content_api_matrix_staging) }}
+    needs:
+      - setup
+      - after_preview
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      pull-requests: write
+      issues: write
+      packages: write
+      security-events: write
+    outputs:
+      live_pr_number: ${{ steps.current-ecs-service.outputs.LIVE_PR_NUMBER }}
+      content_api_update: ${{ matrix.run }}
+    steps:
+      - name: Checkout the repository
+        if: matrix.run
+        uses: actions/checkout@v4
+
+      # - name: configure aws credentials
+      #   if: matrix.run
+      #   # DRYRUN: uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     # DRYRUN: role-to-assume: arn:aws:iam::${{ matrix.accountId }}:role/${{ matrix.environment }}-cicd-role
+      #     # DRYRUN: role-session-name: SCM-CICD
+      #     # DRYRUN: aws-region: ${{ matrix.awsRegion }}
+
+      - name: Get ECS service details for ${{ matrix.environment }}
+        if: matrix.run
+        id: current-ecs-service
+        run: |
+          # Get the ECS current Service JSON
+          SERVICE_JSON=$(aws ecs describe-services --cluster "${{ matrix.environment }}-content" --services "${{ matrix.environment }}-content" --query "services[0].taskDefinition" --output text)
+
+          IMAGE_TAG=$(aws ecs describe-task-definition --task-definition "$SERVICE_JSON" --query "taskDefinition.containerDefinitions[0].image" --output text | cut -d ':' -f 2)
+
+          if [ ! -z "$IMAGE_TAG" ]; then
+            echo "Live PR Number/Image Tag: $IMAGE_TAG"
+            echo "LIVE_PR_NUMBER=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          else
+            echo "No PR Number found."
+            exit 1
+          fi
+
+      - name: Login to Amazon ECR
+        if: matrix.run
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: 'true'
+
+      - name: Render Amazon ECS task definition
+        if: matrix.run
+        uses: InformaPLC/find-and-replace-action@v1.0.2
+        with:
+          input: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/task-definition.json
+          output: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/task-definition-output.json
+          echo_output: 'true'
+          replacement_values: '{"${IMAGE}": "${{ steps.login-ecr.outputs.registry }}/content:${{ matrix.prNum }}", "${NRI_IMAGE}": "${{ steps.login-ecr.outputs.registry }}/nri-ecs:latest", "${SM_IMAGE}": "${{ steps.login-ecr.outputs.registry }}/secrets-manager-agent:latest"}'
+
+      - name: Wait for existing CodeDeploy deployment to complete
+        uses: InformaPLC/codedeploy-wait-for-deployments-action@v1.0.1
+        if: matrix.run
+        timeout-minutes: 10
+        with:
+          application: ${{ matrix.environment }}-content
+          deployment_group: ${{ matrix.environment }}-content
+
+      # - name: Deploy to Amazon ECS
+      #   # DRYRUN:         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      #   if: matrix.run
+      #   id: deploy-to-ecs
+      #   # DRYRUN:         with:
+      #     # DRYRUN:           task-definition: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/task-definition-output.json
+      #     # DRYRUN:           service: ${{ matrix.environment }}-content
+      #     # DRYRUN:           cluster: ${{ matrix.environment }}-content
+      #     # wait-for-service-stability: false
+      #     # DRYRUN:           codedeploy-appspec: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/appspec.json
+      #     # DRYRUN:           codedeploy-application: ${{ matrix.environment }}-content
+      #     # DRYRUN:           codedeploy-deployment-group: ${{ matrix.environment }}-content
+
+      - name: Check for CodeDeploy Completion
+        uses: InformaPLC/codedeploy-completion-check-action@v1.0.1
+        if: matrix.run
+        with:
+          deployment_id: ${{ steps.deploy-to-ecs.outputs.codedeploy-deployment-id }}
+
+      # - name: Deploy to Amazon ECS test
+      #   # DRYRUN:         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      #   if: matrix.run
+      #   # DRYRUN:         with:
+      #     # DRYRUN:           task-definition: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/task-definition-output.json
+      #     # DRYRUN:           service: ${{ matrix.environment }}-content-test
+      #     # DRYRUN:           cluster: ${{ matrix.environment }}-content
+      #     # wait-for-service-stability: false
+
+      - name: Apply New Relic Deployment Marker
+        if: matrix.run
+        continue-on-error: true
+        uses: InformaPLC/newrelic-deployment-marker-action@v1.0.3
+        with:
+          name: ${{ matrix.environment }}-content
+          type: apm
+          region: EU
+          version: ${{ matrix.prNum }}
+
+  frontend_matrix_staging:
+    if: ${{ !failure() && !cancelled() }}
+    name: Frontend staging |> ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.frontend_matrix_staging) }}
+    needs:
+      - setup
+      - lambda2_matrix_staging
+      - content_api_matrix_staging
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      pull-requests: write
+      issues: write
+      packages: write
+      security-events: write
+    outputs:
+      live_pr_number: ${{ steps.current-ecs-service.outputs.LIVE_PR_NUMBER }}
+      frontend_update: ${{ matrix.run }}
+    steps:
+      - name: Checkout the repository
+        if: matrix.run
+        uses: actions/checkout@v4
+
+      # - name: configure aws credentials
+      #   if: matrix.run
+      #   # DRYRUN: uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     # DRYRUN: role-to-assume: arn:aws:iam::${{ matrix.accountId }}:role/${{ matrix.environment }}-cicd-role
+      #     # DRYRUN: role-session-name: SCM-CICD
+      #     # DRYRUN: aws-region: ${{ matrix.awsRegion }}
+
+      - name: Get ECS service details for ${{ matrix.environment }}
+        if: matrix.run
+        id: current-ecs-service
+        run: |
+          # Get the ECS current Service JSON
+          SERVICE_JSON=$(aws ecs describe-services --cluster "${{ matrix.environment }}-${{ matrix.shortName }}" --services "${{ matrix.environment }}-${{ matrix.shortName }}" --query "services[0].taskDefinition" --output text)
+
+          IMAGE_TAG=$(aws ecs describe-task-definition --task-definition "$SERVICE_JSON" --query "taskDefinition.containerDefinitions[0].image" --output text | cut -d ':' -f 2)
+
+          if [ ! -z "$IMAGE_TAG" ]; then
+            echo "Live PR Number/Image Tag: $IMAGE_TAG"
+            echo "LIVE_PR_NUMBER=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          else
+            echo "No PR Number found."
+            exit 1
+          fi
+
+      - name: Login to Amazon ECR
+        if: matrix.run
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: 'true'
+
+      - name: Render Amazon ECS task definition
+        if: matrix.run
+        uses: InformaPLC/find-and-replace-action@v1.0.2
+        with:
+          input: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/task-definition.json
+          output: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/task-definition-output.json
+          echo_output: 'true'
+          replacement_values: '{"${IMAGE}": "${{ steps.login-ecr.outputs.registry }}/${{ matrix.shortName }}:${{ matrix.prNum }}", "${NRI_IMAGE}": "${{ steps.login-ecr.outputs.registry }}/nri-ecs:latest", "${IMAGE_TAG}": "${{ matrix.prNum }}", "${CONTENT_API_URL}": "${{ matrix.contentApiURL }}"}'
+
+      - name: Wait for existing CodeDeploy deployment to complete
+        uses: InformaPLC/codedeploy-wait-for-deployments-action@v1.0.1
+        if: matrix.run
+        timeout-minutes: 10
+        with:
+          application: ${{ matrix.environment }}-${{ matrix.shortName }}
+          deployment_group: ${{ matrix.environment }}-${{ matrix.shortName }}
+
+      # - name: Deploy to Amazon ECS
+      #   # DRYRUN:         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      #   if: matrix.run
+      #   id: deploy-to-ecs
+      #   # DRYRUN:         with:
+      #     # DRYRUN:           task-definition: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/task-definition-output.json
+      #     # DRYRUN:           service: ${{ matrix.environment }}-${{ matrix.shortName }}
+      #     # DRYRUN:           cluster: ${{ matrix.environment }}-${{ matrix.shortName }}
+      #     # wait-for-service-stability: false
+      #     # DRYRUN:           codedeploy-appspec: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/appspec.json
+      #     # DRYRUN:           codedeploy-application: ${{ matrix.environment }}-${{ matrix.shortName }}
+          # DRYRUN:           codedeploy-deployment-group: ${{ matrix.environment }}-${{ matrix.shortName }}
+
+      - name: Check for CodeDeploy Completion
+        uses: InformaPLC/codedeploy-completion-check-action@v1.0.1
+        if: matrix.run
+        with:
+          deployment_id: ${{ steps.deploy-to-ecs.outputs.codedeploy-deployment-id }}
+
+      - name: Check Staging Accessibility
+        if: matrix.run
+        shell: bash
+        id: e2e
+        continue-on-error: true
+        run: |
+          curl -o /dev/null https://${{ matrix.environment }}.scmdemo.informagt.com
+          if [ "$?" = "0" ]; then
+              echo 'code=0' >> $GITHUB_OUTPUT
+          else
+              echo 'code=1' >> $GITHUB_OUTPUT
+          fi
+        env:
+          URL: https://${{ matrix.environment }}.scmdemo.informagt.com
+
+      - name: CodeDeploy Finish or Rollback
+        uses: InformaPLC/codedeploy-finish-or-rollback-action@v1.0.1
+        if: matrix.run
+        with:
+          code: ${{ steps.e2e.outputs.code }}
+          deployment_id: ${{ steps.deploy-to-ecs.outputs.codedeploy-deployment-id }}
+
+      - name: Apply New Relic Deployment Marker
+        if: matrix.run
+        continue-on-error: true
+        uses: InformaPLC/newrelic-deployment-marker-action@v1.0.3
+        with:
+          name: ${{ matrix.environment }}-${{ matrix.shortName }}
+          type: apm
+          region: EU
+          version: ${{ matrix.prNum }}
+
+  worker_matrix_staging:
+    if: ${{ !failure() && !cancelled() }}
+    name: CloudFlare worker |> ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.worker_matrix_staging) }}
+    needs: setup
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      id-token: write
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout the repository
+        if: matrix.run
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        if: matrix.run
+        uses: ./.github/actions/install_deps
+        timeout-minutes: 10
+        with:
+          npm-token: ${{ secrets.GITHUB_TOKEN }}
+          setup: 'false'
+
+      - name: CloudFlare worker deploy
+        if: matrix.run
+        uses: ./.github/actions/cloudflare_worker_deploy
+
+  ui_matrix_staging:
+    if: ${{ !failure() && !cancelled() }}
+    name: UI app |> ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.ui_matrix_staging) }}
+    needs: setup
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      id-token: write
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout the repository
+        if: matrix.run
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        if: matrix.run
+        uses: ./.github/actions/install_deps
+        timeout-minutes: 10
+        with:
+          npm-token: ${{ secrets.GITHUB_TOKEN }}
+          setup: 'false'
+
+      - name: UI app deploy
+        if: matrix.run
+        uses: ./.github/actions/ui_app_deploy
+
+  purge_redis_cache:
+    name: Purge Redis cache
+    if: ${{ !failure() && !cancelled() && needs.content_api_matrix_staging.outputs.content_api_update == 'true' }}
+    needs:
+      - content_api_matrix_staging
+      - frontend_matrix_staging
+    uses: ./.github/workflows/redis_cache_purge.yml
+    with:
+      environment: staging
+      stack-id: testautomation
+    secrets: inherit
+
+  purge_cloudflare_cache:
+    name: Purge Cloudflare cache
+    if: ${{ !failure() && !cancelled() && needs.frontend_matrix_staging.outputs.frontend_update == 'true' }}
+    needs:
+      - purge_redis_cache
+      - frontend_matrix_staging
+    uses: ./.github/workflows/cloudflare_cache_purge.yml
+    secrets: inherit
+    with:
+      stack-id: testautomation
+      prefix: staging-testautomation
+
+  after_staging:
+    name: After staging
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    needs:
+      - setup
+      - frontend_matrix_staging
+      - lambda2_matrix_staging
+      - content_api_matrix_staging
+      - worker_matrix_staging
+      - ui_matrix_staging
+      - purge_redis_cache
+      - purge_cloudflare_cache
+    steps:
+      - name: Check pipeline status
+        run: |
+          echo "setup = ${{ needs.setup.result }}"
+          echo "frontend_matrix_staging = ${{ needs.frontend_matrix_staging.result }}"
+          echo "lambda2_matrix_staging = ${{ needs.lambda2_matrix_staging.result }}"
+          echo "content_api_matrix_staging = ${{ needs.content_api_matrix_staging.result }}"
+          echo "worker_matrix_staging = ${{ needs.worker_matrix_staging.result }}"
+          echo "ui_matrix_staging = ${{ needs.ui_matrix_staging.result }}"
+          echo "purge_redis_cache = ${{ needs.purge_redis_cache.result }}"
+          echo "purge_cloudflare_cache = ${{ needs.purge_cloudflare_cache.result }}"
+          if [ "${{ needs.setup.result }}" == "success" ] && \
+              [ "${{ needs.frontend_matrix_staging.result }}" == "success" ] && \
+              [ "${{ needs.lambda2_matrix_staging.result }}" == "success" ] && \
+              [ "${{ needs.content_api_matrix_staging.result }}" == "success" ] && \
+              [ "${{ needs.worker_matrix_staging.result }}" == "success" ] && \
+              [ "${{ needs.ui_matrix_staging.result }}" == "success" ]
+          then
+            echo "Pipeline passed! hooray!!"
+          else
+            echo "Pipeline failed, check the logs on other steps please."
+            exit 1
+          fi
+
+  #####################
+  e2e_tests_smokes:
+    name: E2E tests smokes
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    if: ${{ !failure() && !cancelled() && needs.setup.outputs.skip_deployment == 'false' }}
+    needs:
+      - setup
+      - after_staging
+      - content_api_matrix_staging
+    uses: ./.github/workflows/e2e_tests.yml
+    with:
+      content-api-url: 'https://content.staging.scm.informagt.com/graphql'
+      spec-tags: '@smokeTA and not @runLocally and not @content-model and not @iiris and not @ads'
+      spec-name: '*.feature'
+    secrets: inherit
+
+  e2e_tests:
+    name: E2E tests full
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    if: ${{ !failure() && !cancelled() && needs.setup.outputs.skip_deployment == 'false' }}
+    needs:
+      - setup
+      - after_staging
+      - content_api_matrix_staging
+    uses: ./.github/workflows/e2e_tests.yml
+    with:
+      content-api-url: 'https://content.staging.scm.informagt.com/graphql'
+      spec-tags: 'not @runLocally and not @content-model and not @iiris and not @ads'
+      spec-name: '*.feature'
+    secrets: inherit
+
+  e2e_iiris_tests:
+    name: E2E iiris tests
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    if: ${{ !failure() && !cancelled() && needs.setup.outputs.skip_deployment == 'false' }}
+    needs:
+      - setup
+      - after_staging
+      - content_api_matrix_staging
+    uses: ./.github/workflows/e2e_tests.yml
+    with:
+      content-api-url: 'https://content.staging.scm.informagt.com/graphql'
+      spec-tags: '@iiris and not @runLocally'
+      spec-name: |
+        gatedPaidContentRegistrationFromHeader.feature
+        gatedPaidContentRegistrationFromHeader_2.feature
+        gatedPaidContentRegistrationViaLogInLink_2.feature
+        gatedPaidContentRegistrationViaLogInLink.feature
+        gatedPaidContentRegistrationViaPurchaseButton_2.feature
+        gatedPaidContentRegistrationViaPurchaseButton.feature
+        gatedPaidContentSignIn.feature
+        gatedPaidContentSignIn_2.feature
+        gatedPaidContentSignIn_3.feature
+        gatedUnpaidContentRegistration.feature
+        gatedUnpaidContentRegistration_2.feature
+        gatedUnpaidContentRegistration_3.feature
+        gatedUnpaidContentSignIn.feature
+        gatedUnpaidContentSignIn_2.feature
+        gatedUnpaidContentSignIn_3.feature
+        myPurchases.feature
+        myPurchases_2.feature
+        unpaidContent_2.feature
+        unpaidContent_3.feature
+        gatedContentOpenForm.feature
+        gatedContentRegistrationAndEloqua.feature
+        ourProducts.feature
+        ourProducts_2.feature
+        newsletterSubscriptionAnonymousUser.feature
+        newsletterSubscriptionRegisteredUser.feature
+        signOut.feature
+        onePageRegister.feature
+        iirisRecommendModule.feature
+        profile.feature
+        recipe.feature
+        article.feature
+        document.feature
+        journal.feature
+        register.feature
+        podcast.feature
+        dataLayer.feature
+        signIn.feature
+        slideshow.feature
+        video.feature
+        webinar.feature
+        cookieBanner.feature
+        enhancedListChildPage.feature
+        home.feature
+        multiSectionArticle.feature
+    secrets: inherit
+
+  # e2e_webhooks:
+  #   if: ${{ !failure() && !cancelled() && needs.setup.outputs.skip_deployment == 'false' }}
+  #   name: E2E webhooks
+  #   needs:
+  #     - setup
+  #     - after_staging
+  #   uses: ./.github/workflows/e2e_webhooks.yml
+  #   secrets: inherit
+
+  staging_rollback:
+    name: Staging rollback
+    if: ${{ always() && ((needs.e2e_tests_smokes.result == 'failure') || (needs.e2e_tests_smokes.result == 'canceled') || (fromJson(needs.e2e_tests.outputs.passRate || '0') < 95)) }}
+    needs:
+      - setup
+      - e2e_tests
+      - e2e_tests_smokes
+      - after_staging
+      - frontend_matrix_staging
+      - content_api_matrix_staging
+    uses: ./.github/workflows/staging_rollback.yml
+    with:
+      nx_affected: ${{ needs.setup.outputs.nx_affected }}
+      pr_number_frontend: ${{ needs.frontend_matrix_staging.outputs.live_pr_number }}
+      pr_number_content_api: ${{ needs.content_api_matrix_staging.outputs.live_pr_number }}
+    secrets: inherit
+
+  content_api_matrix_live_preview:
+    name: Content API LIVE preview |> ${{ matrix.name }}
+    if: ${{ !cancelled() && (needs.e2e_tests_smokes.result != 'failure' && (fromJson(needs.e2e_tests.outputs.passRate || '0') >= 95) && needs.after_staging.result == 'success') }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.content_api_matrix_preview) }}
+    needs:
+      - setup
+      - e2e_tests
+      - e2e_tests_smokes
+      - after_staging
+    runs-on: ubuntu22-4core
+    permissions:
+      actions: write
+      id-token: write
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout the repository
+        if: matrix.run
+        uses: actions/checkout@v4
+
+      # - name: configure aws credentials
+      #   if: matrix.run
+      #   # DRYRUN: uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     # DRYRUN: role-to-assume: arn:aws:iam::${{ matrix.accountId }}:role/${{ matrix.environment }}-cicd-role
+      #     # DRYRUN: role-session-name: SCM-CICD
+      #     # DRYRUN: aws-region: ${{ matrix.awsRegion }}
+
+      - name: Login to Amazon ECR
+        if: matrix.run
+        id: login-ecr-live
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: 'true'
+
+      - name: Render Amazon ECS task definition
+        if: matrix.run
+        uses: InformaPLC/find-and-replace-action@v1.0.2
+        with:
+          input: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/task-definition-live-version.json
+          output: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/task-definition-output.json
+          echo_output: 'true'
+          replacement_values: '{"${IMAGE}": "${{ steps.login-ecr-live.outputs.registry }}/content:${{ matrix.prNum }}", "${NRI_IMAGE}": "${{ steps.login-ecr-live.outputs.registry }}/nri-ecs:latest", "${SM_IMAGE}": "${{ steps.login-ecr-live.outputs.registry }}/secrets-manager-agent:latest"}'
+
+      - name: Wait for existing CodeDeploy deployment to complete
+        uses: InformaPLC/codedeploy-wait-for-deployments-action@v1.0.1
+        if: matrix.run
+        timeout-minutes: 10
+        with:
+          application: ${{ matrix.environment }}-content
+          deployment_group: ${{ matrix.environment }}-content
+
+      # - name: Deploy to Amazon ECS
+      #   # DRYRUN:         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      #   if: matrix.run
+      #   id: deploy-to-ecs
+      #   # DRYRUN:         with:
+      #     # DRYRUN:           task-definition: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/task-definition-output.json
+      #     # DRYRUN:           service: ${{ matrix.environment }}-content
+      #     # DRYRUN:           cluster: ${{ matrix.environment }}-content
+      #     # wait-for-service-stability: false
+      #     # DRYRUN:           codedeploy-appspec: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/appspec.json
+      #     # DRYRUN:           codedeploy-application: ${{ matrix.environment }}-content
+      #     # DRYRUN:           codedeploy-deployment-group: ${{ matrix.environment }}-content
+
+      - name: Check for CodeDeploy Completion
+        uses: InformaPLC/codedeploy-completion-check-action@v1.0.1
+        if: matrix.run
+        with:
+          deployment_id: ${{ steps.deploy-to-ecs.outputs.codedeploy-deployment-id }}
+
+      # - name: Deploy to Amazon ECS test
+      #   # DRYRUN:         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      #   if: matrix.run
+        # DRYRUN:         with:
+          # DRYRUN:           task-definition: services/${{ matrix.shortName }}/src/config/${{ matrix.environment }}/task-definition-output.json
+          # DRYRUN:           service: ${{ matrix.environment }}-content-test
+          # DRYRUN:           cluster: ${{ matrix.environment }}-content
+          # wait-for-service-stability: false
+
+  lambda2_matrix_staging_live:
+    name: Lambda2 update LIVE alias |> ${{ matrix.name }}
+    if: ${{ !cancelled() && (needs.e2e_tests_smokes.result != 'failure' && (fromJson(needs.e2e_tests.outputs.passRate) || 0 >= 95) && needs.after_staging.result == 'success') }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.lambda2_matrix_staging) }}
+    needs:
+      - setup
+      - e2e_tests
+      - e2e_tests_smokes
+      - after_staging
+    runs-on: ubuntu-22.04
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout the repository
+        if: matrix.run
+        uses: actions/checkout@v4
+
+      # - name: configure aws credentials
+      #   if: matrix.run
+      #   # DRYRUN: uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     # DRYRUN: role-to-assume: arn:aws:iam::${{ matrix.accountId }}:role/${{ matrix.environment }}-cicd-role
+      #     # DRYRUN: role-session-name: SCM-CICD
+      #     # DRYRUN: aws-region: ${{ matrix.awsRegion }}
+
+      - name: Update LIVE alias
+        if: matrix.run
+        run: |
+          version=$(aws lambda get-alias --function-name ${{ matrix.environment }}-${{ matrix.shortName }} --name 'PRE-LIVE' --query 'FunctionVersion' --output text)
+          aws lambda update-alias --function-name ${{ matrix.environment }}-${{ matrix.shortName }} --function-version $version --name 'LIVE'
+
+      - name: Login to Amazon ECR
+        if: matrix.run
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: 'true'
+
+      # - name: Lambda Deploy Lambda Stable to Preview LIVE Alias
+      #   if: matrix.run && matrix.vertical == 'unified'
+      # # DRYRUN:         uses: InformaPLC/lambda-deploy-action@v1.0.3
+      #   with:
+      #   # DRYRUN:           function_name: preview-${{ matrix.shortName }}
+      #   # DRYRUN:           lambda_type: 'container'
+      #   # DRYRUN:           container_image: ${{ steps.login-ecr.outputs.registry }}/${{ matrix.shortName }}:${{ matrix.prNum }}
+      #     architecture: 'x86_64'
+      #     codedeploy_enabled: 'yes'
+      #     version_description: pr-${{ matrix.prNum }}:main
+      #     codedeploy_app_name: preview-${{ matrix.shortName }}
+      #     codedeploy_dg_name: preview-${{ matrix.shortName }}
+      #   # DRYRUN:           lambda_alias: 'LIVE'
+
+  after:
+    name: Check job results
+    if: always()
+    runs-on: ubuntu-latest
+    needs:
+      - after_preview
+      - after_staging
+      - e2e_tests
+      - e2e_tests_smokes
+      - e2e_iiris_tests
+      # - e2e_webhooks
+      - lambda2_matrix_staging_live
+      - content_api_matrix_live_preview
+    steps:
+      - name: Check pipeline status
+        run: |
+          echo "after_preview = ${{ needs.after_preview.result }}"
+          echo "after_staging = ${{ needs.after_staging.result }}"
+          echo "e2e_tests = ${{ needs.e2e_tests.result }}"
+          echo "e2e_tests_pass_rate = ${{ needs.e2e_tests.outputs.passRate }}"
+          echo "e2e_tests_smokes = ${{ needs.e2e_tests_smokes.result }}"
+          echo "e2e_tests_smokes_pass_rate = ${{ needs.e2e_tests_smokes.outputs.passRate }}"
+          echo "e2e_iriis_tests = ${{ needs.e2e_iiris_tests.result }}"
+          echo "e2e_iriis_tests_pass_rate = ${{ needs.e2e_iiris_tests.outputs.passRate }}"
+          echo "lambda2_matrix_staging_live = ${{ needs.lambda2_matrix_staging_live.result }}"
+          echo "content_api_matrix_live_preview = ${{ needs.content_api_matrix_live_preview.result }}"
+          if [ "${{ needs.after_preview.result }}" != "success" ] || \
+              [ "${{ needs.after_staging.result }}" != "success" ] || \
+              [ "${{ needs.lambda2_matrix_staging_live.result }}" != "success" ] || \
+              [ "${{ needs.content_api_matrix_live_preview.result }}" != "success" ]
+          then
+            echo "Pipeline failed, check the logs on other steps please."
+            exit 1
+          fi
+          if [ "${{ needs.e2e_tests_smokes.result }}" == "success" ] || \
+              [ "${{ needs.e2e_tests_smokes.result }}" == "skipped" ]
+          then
+            echo "Pipeline passed! hooray!!"
+          else
+            echo "Pipeline failed, check the logs on other steps please."
+            exit 1
+          fi
